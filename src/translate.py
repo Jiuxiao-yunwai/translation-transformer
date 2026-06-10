@@ -2,46 +2,63 @@ import argparse
 
 import torch
 
-from data.dataset import detokenize_cn, encode_tokens, ids_to_tokens, load_vocab
-from eval import load_model
-from train import get_device
+from data import tokenize_src
+from decoding import beam_search_decode, greedy_decode
+from models import Seq2SeqTransformer
+from utils import get_device
+from vocab import PAD_IDX, Vocab
 
 
-def normalize_english(sentence: str) -> list[str]:
-    return sentence.strip().lower().split()
+def load_model(ckpt_path: str, device: torch.device) -> tuple[Seq2SeqTransformer, Vocab, Vocab]:
+    ckpt = torch.load(ckpt_path, map_location=device)
+    src_vocab = Vocab.from_dict(ckpt["src_vocab"])
+    tgt_vocab = Vocab.from_dict(ckpt["tgt_vocab"])
+    model = Seq2SeqTransformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        pad_idx=PAD_IDX,
+        **ckpt["model_args"],
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, src_vocab, tgt_vocab
 
 
 @torch.no_grad()
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Translate one English sentence with a trained checkpoint.")
-    parser.add_argument("sentence", nargs="+")
-    parser.add_argument("--data-dir", default="data/cmn-eng-simple")
-    parser.add_argument("--checkpoint", default="checkpoints/best.pt")
-    parser.add_argument("--max-len", type=int, default=64)
+    parser = argparse.ArgumentParser(description="Translate one English sentence.")
+    parser.add_argument("--ckpt", default="checkpoints/best.pt")
+    parser.add_argument("--sentence", required=True)
+    parser.add_argument("--max_len", type=int, default=80)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--decode", choices=["beam", "greedy"], default="beam")
-    parser.add_argument("--beam-size", type=int, default=4)
-    parser.add_argument("--length-penalty", type=float, default=0.6)
+    parser.add_argument("--decode", choices=["greedy", "beam"], default="beam")
+    parser.add_argument("--beam_size", type=int, default=5)
+    parser.add_argument("--length_penalty", type=float, default=0.6)
+    parser.add_argument("--min_decode_len", type=int, default=2)
     args = parser.parse_args()
 
-    sentence = " ".join(args.sentence)
     device = get_device(args.device)
-    src_word2id, _, _, _ = load_vocab(args.data_dir)
-    model, tgt_id2word = load_model(args.checkpoint, args.data_dir, device)
+    model, src_vocab, tgt_vocab = load_model(args.ckpt, device)
+    src_ids = src_vocab.encode(tokenize_src(args.sentence), add_eos=True)
+    src = torch.tensor(src_ids, dtype=torch.long, device=device).unsqueeze(1)
 
-    src_ids = encode_tokens(normalize_english(sentence), src_word2id)
-    src = torch.tensor([src_ids], dtype=torch.long, device=device)
     if args.decode == "beam":
-        output = model.beam_search_decode(
+        pred = beam_search_decode(
+            model,
             src,
+            src_vocab,
+            tgt_vocab,
             max_len=args.max_len,
             beam_size=args.beam_size,
             length_penalty=args.length_penalty,
-        )[0].tolist()
+            min_len=args.min_decode_len,
+        )
     else:
-        output = model.greedy_decode(src, max_len=args.max_len)[0].tolist()
-    tokens = ids_to_tokens(output, tgt_id2word)
-    print(detokenize_cn(tokens))
+        pred = greedy_decode(model, src, src_vocab, tgt_vocab, max_len=args.max_len)
+
+    pred_ids = pred.squeeze(1).tolist()
+    pred_tokens = tgt_vocab.decode(pred_ids, remove_special=True, stop_at_eos=True)
+    print(" ".join(pred_tokens))
 
 
 if __name__ == "__main__":

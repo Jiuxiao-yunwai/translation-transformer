@@ -1,117 +1,128 @@
-import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
-from utils.constants import BOS_ID, EOS_ID, PAD_ID, UNK_ID
+from vocab import BOS_IDX, EOS_IDX, PAD_IDX, Vocab
 
 
-def load_vocab(data_dir: str | Path) -> tuple[dict[str, int], dict[int, str], dict[str, int], dict[int, str]]:
-    data_dir = Path(data_dir)
-    with (data_dir / "word2int_en.json").open(encoding="utf-8") as f:
-        src_word2id = json.load(f)
-    with (data_dir / "int2word_en.json").open(encoding="utf-8") as f:
-        src_id2word = {int(k): v for k, v in json.load(f).items()}
-    with (data_dir / "word2int_cn.json").open(encoding="utf-8") as f:
-        tgt_word2id = json.load(f)
-    with (data_dir / "int2word_cn.json").open(encoding="utf-8") as f:
-        tgt_id2word = {int(k): v for k, v in json.load(f).items()}
-    return src_word2id, src_id2word, tgt_word2id, tgt_id2word
+@dataclass
+class ParallelExample:
+    src_tokens: list[str]
+    tgt_tokens: list[str]
 
 
-def encode_tokens(tokens: list[str], vocab: dict[str, int], add_bos: bool = False) -> list[int]:
-    ids = [vocab.get(token, UNK_ID) for token in tokens]
-    if add_bos:
-        ids = [BOS_ID] + ids
-    return ids + [EOS_ID]
+def tokenize_src(text: str) -> list[str]:
+    return text.lower().strip().split()
 
 
-def ids_to_tokens(ids: list[int], id2word: dict[int, str]) -> list[str]:
-    tokens: list[str] = []
-    for idx in ids:
-        if idx in (PAD_ID, BOS_ID):
-            continue
-        if idx == EOS_ID:
-            break
-        tokens.append(id2word.get(idx, "<UNK>"))
-    return tokens
+def tokenize_tgt(text: str) -> list[str]:
+    return text.strip().split()
 
 
-def detokenize_cn(tokens: list[str]) -> str:
-    return "".join(token for token in tokens if token not in {"<PAD>", "<BOS>", "<EOS>"})
+def read_parallel_data(path: str | Path, max_src_len: int = 80, max_tgt_len: int = 80) -> list[ParallelExample]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"data file not found: {path}")
+
+    examples: list[ParallelExample] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.rstrip("\n")
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"{path}:{line_no} is not tab-separated as 'english sentence\\tchinese sentence'."
+                )
+
+            src_tokens = tokenize_src(parts[0])
+            tgt_tokens = tokenize_tgt(parts[1])
+            if not src_tokens or not tgt_tokens:
+                continue
+            if len(src_tokens) > max_src_len or len(tgt_tokens) > max_tgt_len:
+                continue
+            examples.append(ParallelExample(src_tokens=src_tokens, tgt_tokens=tgt_tokens))
+
+    if not examples:
+        raise ValueError(f"no usable sentence pairs found in {path}")
+    return examples
+
+
+def build_vocabs(
+    train_examples: list[ParallelExample],
+    min_freq: int = 1,
+    max_src_vocab_size: int | None = None,
+    max_tgt_vocab_size: int | None = None,
+) -> tuple[Vocab, Vocab]:
+    src_vocab = Vocab.build(
+        [example.src_tokens for example in train_examples],
+        min_freq=min_freq,
+        max_size=max_src_vocab_size,
+    )
+    tgt_vocab = Vocab.build(
+        [example.tgt_tokens for example in train_examples],
+        min_freq=min_freq,
+        max_size=max_tgt_vocab_size,
+    )
+    return src_vocab, tgt_vocab
 
 
 class TranslationDataset(Dataset):
-    def __init__(
-        self,
-        path: str | Path,
-        src_word2id: dict[str, int],
-        tgt_word2id: dict[str, int],
-        max_src_len: int | None = None,
-        max_tgt_len: int | None = None,
-    ) -> None:
-        self.samples: list[tuple[list[int], list[int], list[str], list[str]]] = []
-        path = Path(path)
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            src_text, tgt_text = line.split("\t")
-            src_tokens = src_text.split()
-            tgt_tokens = tgt_text.split()
-            src_ids = encode_tokens(src_tokens, src_word2id)
-            tgt_ids = encode_tokens(tgt_tokens, tgt_word2id, add_bos=True)
-            if max_src_len is not None and len(src_ids) > max_src_len:
-                continue
-            if max_tgt_len is not None and len(tgt_ids) > max_tgt_len:
-                continue
-            self.samples.append((src_ids, tgt_ids, src_tokens, tgt_tokens))
+    def __init__(self, examples: list[ParallelExample], src_vocab: Vocab, tgt_vocab: Vocab) -> None:
+        self.examples = examples
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.examples)
 
-    def __getitem__(self, index: int) -> tuple[list[int], list[int], list[str], list[str]]:
-        return self.samples[index]
-
-
-def make_collate_fn(pad_id: int = PAD_ID) -> Callable:
-    def collate(batch: list[tuple[list[int], list[int], list[str], list[str]]]) -> dict[str, object]:
-        src_ids, tgt_ids, src_tokens, tgt_tokens = zip(*batch)
-        src_max_len = max(len(x) for x in src_ids)
-        tgt_max_len = max(len(x) for x in tgt_ids)
-
-        src = torch.full((len(batch), src_max_len), pad_id, dtype=torch.long)
-        tgt = torch.full((len(batch), tgt_max_len), pad_id, dtype=torch.long)
-        for i, (src_item, tgt_item) in enumerate(zip(src_ids, tgt_ids)):
-            src[i, : len(src_item)] = torch.tensor(src_item, dtype=torch.long)
-            tgt[i, : len(tgt_item)] = torch.tensor(tgt_item, dtype=torch.long)
-
+    def __getitem__(self, idx: int) -> dict:
+        example = self.examples[idx]
+        src_ids = self.src_vocab.encode(example.src_tokens, add_eos=True)
+        tgt_input_ids = [BOS_IDX] + self.tgt_vocab.encode(example.tgt_tokens)
+        tgt_output_ids = self.tgt_vocab.encode(example.tgt_tokens) + [EOS_IDX]
         return {
-            "src": src,
-            "tgt_in": tgt[:, :-1],
-            "tgt_out": tgt[:, 1:],
-            "src_tokens": list(src_tokens),
-            "tgt_tokens": list(tgt_tokens),
+            "src_ids": torch.tensor(src_ids, dtype=torch.long),
+            "tgt_input_ids": torch.tensor(tgt_input_ids, dtype=torch.long),
+            "tgt_output_ids": torch.tensor(tgt_output_ids, dtype=torch.long),
+            "src_text": " ".join(example.src_tokens),
+            "tgt_text": " ".join(example.tgt_tokens),
+            "tgt_tokens": example.tgt_tokens,
         }
 
-    return collate
+
+def collate_fn(batch: list[dict]) -> dict:
+    src = pad_sequence([item["src_ids"] for item in batch], padding_value=PAD_IDX)
+    tgt_input = pad_sequence([item["tgt_input_ids"] for item in batch], padding_value=PAD_IDX)
+    tgt_output = pad_sequence([item["tgt_output_ids"] for item in batch], padding_value=PAD_IDX)
+    return {
+        "src": src,
+        "tgt_input": tgt_input,
+        "tgt_output": tgt_output,
+        "src_text": [item["src_text"] for item in batch],
+        "tgt_text": [item["tgt_text"] for item in batch],
+        "tgt_tokens": [item["tgt_tokens"] for item in batch],
+    }
 
 
-def build_dataloader(
-    data_dir: str | Path,
-    split: str,
-    src_word2id: dict[str, int],
-    tgt_word2id: dict[str, int],
+def create_dataloader(
+    examples: list[ParallelExample],
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
     batch_size: int,
     shuffle: bool,
     num_workers: int = 0,
 ) -> DataLoader:
-    dataset = TranslationDataset(Path(data_dir) / f"{split}.txt", src_word2id, tgt_word2id)
+    dataset = TranslationDataset(examples, src_vocab, tgt_vocab)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=make_collate_fn(),
+        collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available(),
     )

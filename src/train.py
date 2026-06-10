@@ -1,50 +1,125 @@
 import argparse
 import math
-import sys
+import re
+from datetime import datetime
 from pathlib import Path
 
 import torch
 from torch import nn
 from tqdm.auto import tqdm
 
-from data.dataset import build_dataloader, load_vocab
-from models.transformer import TransformerMT
-from utils.constants import PAD_ID
-from utils.metrics import corpus_bleu
+from data import build_vocabs, create_dataloader, read_parallel_data
+from evaluation import bleu_scores_from_records, evaluate, evaluate_loss_and_accuracy, write_predictions
+from models import Seq2SeqTransformer
+from utils import ensure_dir, generate_square_subsequent_mask, get_device, make_padding_mask, save_json, set_seed
+from vocab import PAD_IDX, Vocab
 
 
-def get_device(name: str) -> torch.device:
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a small Transformer for English-to-Chinese translation.")
+    parser.add_argument("--train_path", default="data/train.txt")
+    parser.add_argument("--valid_path", default="data/valid.txt")
+    parser.add_argument("--test_path", default="data/test.txt")
+    parser.add_argument("--checkpoint_dir", default="checkpoints")
+    parser.add_argument("--output_dir", default="outputs")
+    parser.add_argument("--run_name", default=None, help="Experiment name. Defaults to an auto timestamped name.")
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--scheduler", choices=["none", "warmup_cosine"], default="warmup_cosine")
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--eta_min", type=float, default=1e-5)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--num_encoder_layers", type=int, default=None)
+    parser.add_argument("--num_decoder_layers", type=int, default=None)
+    parser.add_argument("--dim_feedforward", type=int, default=512)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.03)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--max_src_len", type=int, default=80)
+    parser.add_argument("--max_tgt_len", type=int, default=80)
+    parser.add_argument("--max_len", type=int, default=80)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--min_freq", type=int, default=1)
+    parser.add_argument("--decode", choices=["greedy", "beam"], default="beam")
+    parser.add_argument(
+        "--test_decode",
+        choices=["greedy", "beam"],
+        default=None,
+        help="Decode method for final test. Defaults to --decode.",
+    )
+    parser.add_argument("--beam_size", type=int, default=5)
+    parser.add_argument("--length_penalty", type=float, default=0.6)
+    parser.add_argument("--min_decode_len", type=int, default=2)
+    parser.add_argument("--bleu_every", type=int, default=1, help="Compute validation BLEU every N epochs.")
+    parser.add_argument(
+        "--final_ckpt",
+        choices=["best", "last"],
+        default="best",
+        help="Checkpoint used for final test evaluation.",
+    )
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop after this many non-improving validation BLEU epochs. 0 disables early stopping.",
+    )
+    parser.add_argument("--min_delta", type=float, default=0.01, help="Minimum BLEU improvement for early stopping.")
+    return parser.parse_args()
 
 
-def make_model(args: argparse.Namespace, src_vocab_size: int, tgt_vocab_size: int) -> TransformerMT:
-    return TransformerMT(
-        src_vocab_size=src_vocab_size,
-        tgt_vocab_size=tgt_vocab_size,
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        d_ff=args.d_ff,
-        dropout=args.dropout,
-        max_len=args.max_len,
+def sanitize_run_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return name.strip("._-") or "run"
+
+
+def make_run_name(args: argparse.Namespace) -> str:
+    if args.run_name:
+        return sanitize_run_name(args.run_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return sanitize_run_name(
+        f"{timestamp}_dm{args.d_model}_bs{args.batch_size}_{args.decode}"
     )
 
 
-def run_epoch(
-    model: TransformerMT,
+def build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, steps_per_epoch: int):
+    if args.scheduler == "none":
+        return None
+
+    total_steps = max(args.epochs * steps_per_epoch, 1)
+    warmup_steps = min(max(args.warmup_steps, 1), total_steps)
+    decay_steps = max(total_steps - warmup_steps, 1)
+    min_lr_ratio = args.eta_min / args.lr
+
+    def lr_lambda(step: int) -> float:
+        step = max(step, 1)
+        if step <= warmup_steps:
+            return step / warmup_steps
+        progress = min((step - warmup_steps) / decay_steps, 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def train_one_epoch(
+    model: Seq2SeqTransformer,
     dataloader,
     criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
     device: torch.device,
-    optimizer: torch.optim.Optimizer | None = None,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-    grad_clip: float = 1.0,
-    desc: str = "train",
-    show_progress: bool = True,
+    grad_clip: float,
+    desc: str,
+    show_progress: bool,
 ) -> float:
-    is_train = optimizer is not None
-    model.train(is_train)
+    model.train()
     total_loss = 0.0
     total_tokens = 0
 
@@ -53,246 +128,326 @@ def run_epoch(
         desc=desc,
         leave=False,
         dynamic_ncols=True,
-        mininterval=0.5,
-        file=sys.stdout,
         disable=not show_progress,
     )
     for batch in progress:
         src = batch["src"].to(device)
-        tgt_in = batch["tgt_in"].to(device)
-        tgt_out = batch["tgt_out"].to(device)
+        tgt_input = batch["tgt_input"].to(device)
+        tgt_output = batch["tgt_output"].to(device)
+        tgt_mask = generate_square_subsequent_mask(tgt_input.size(0), device)
+        src_pad_mask = make_padding_mask(src)
+        tgt_pad_mask = make_padding_mask(tgt_input)
 
-        logits = model(src, tgt_in)
-        raw_loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-        ntokens = tgt_out.ne(PAD_ID).sum().item()
-        loss = raw_loss / max(ntokens, 1)
+        logits = model(
+            src,
+            tgt_input,
+            src_key_padding_mask=src_pad_mask,
+            tgt_key_padding_mask=tgt_pad_mask,
+            memory_key_padding_mask=src_pad_mask,
+            tgt_mask=tgt_mask,
+        )
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
 
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
-        total_loss += raw_loss.item()
-        total_tokens += ntokens
-        postfix = {"loss": f"{total_loss / max(total_tokens, 1):.4f}"}
-        if optimizer is not None:
-            postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
-        progress.set_postfix(postfix)
+        non_pad_tokens = int(tgt_output.ne(PAD_IDX).sum().item())
+        total_loss += loss.item()
+        total_tokens += non_pad_tokens
+        progress.set_postfix(
+            loss=f"{total_loss / max(total_tokens, 1):.4f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+        )
 
     return total_loss / max(total_tokens, 1)
 
 
-@torch.no_grad()
-def evaluate_bleu(
-    model: TransformerMT,
-    dataloader,
-    tgt_id2word: dict[int, str],
-    device: torch.device,
-    max_len: int,
-    decode: str = "beam",
-    beam_size: int = 4,
-    length_penalty: float = 0.6,
-    desc: str = "bleu",
-    show_progress: bool = True,
-) -> float:
-    from data.dataset import ids_to_tokens
-
-    model.eval()
-    references: list[list[str]] = []
-    candidates: list[list[str]] = []
-    progress = tqdm(
-        dataloader,
-        desc=desc,
-        leave=False,
-        dynamic_ncols=True,
-        mininterval=0.5,
-        file=sys.stdout,
-        disable=not show_progress,
-    )
-    for batch in progress:
-        src = batch["src"].to(device)
-        if decode == "beam":
-            output = model.beam_search_decode(
-                src,
-                max_len=max_len,
-                beam_size=beam_size,
-                length_penalty=length_penalty,
-            )
-        else:
-            output = model.greedy_decode(src, max_len=max_len)
-        for ids, ref in zip(output.tolist(), batch["tgt_tokens"]):
-            candidates.append(ids_to_tokens(ids, tgt_id2word))
-            references.append(ref)
-    return corpus_bleu(references, candidates)
-
-
-def build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, steps_per_epoch: int):
-    if args.scheduler == "none":
-        return None
-    if args.scheduler == "warmup_cosine":
-        total_steps = max(args.epochs * steps_per_epoch, 1)
-        warmup_steps = max(args.warmup_steps, 1)
-        decay_steps = max(total_steps - warmup_steps, 1)
-        min_lr_ratio = args.eta_min / args.lr
-
-        def warmup_cosine_lambda(step: int) -> float:
-            step = max(step, 1)
-            if step <= warmup_steps:
-                return step / warmup_steps
-            progress = min((step - warmup_steps) / decay_steps, 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_cosine_lambda)
-
-    def noam_lambda(step: int) -> float:
-        step = max(step, 1)
-        warmup = max(args.warmup_steps, 1)
-        scale = (args.d_model ** -0.5) * min(step ** -0.5, step * (warmup ** -1.5))
-        return args.lr_factor * scale
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=noam_lambda)
-
-
 def save_checkpoint(
     path: Path,
-    model: TransformerMT,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    val_loss: float,
-    bleu: float,
+    model: Seq2SeqTransformer,
+    src_vocab: Vocab,
+    tgt_vocab: Vocab,
     args: argparse.Namespace,
+    epoch: int,
+    valid_bleu: float,
+    valid_loss: float,
+    valid_token_acc: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-            "epoch": epoch,
-            "val_loss": val_loss,
-            "bleu": bleu,
+            "model_state_dict": model.state_dict(),
+            "src_vocab": src_vocab.to_dict(),
+            "tgt_vocab": tgt_vocab.to_dict(),
             "model_args": {
                 "d_model": args.d_model,
-                "num_layers": args.num_layers,
-                "num_heads": args.num_heads,
-                "d_ff": args.d_ff,
+                "nhead": args.nhead,
+                "num_encoder_layers": args.num_encoder_layers or args.num_layers,
+                "num_decoder_layers": args.num_decoder_layers or args.num_layers,
+                "dim_feedforward": args.dim_feedforward,
                 "dropout": args.dropout,
-                "max_len": args.max_len,
+                "max_len": max(args.max_src_len + 1, args.max_tgt_len + 1, args.max_len + 1, 100),
             },
             "train_args": vars(args),
-            "data_dir": args.data_dir,
+            "epoch": epoch,
+            "valid_bleu": valid_bleu,
+            "valid_loss": valid_loss,
+            "valid_token_acc": valid_token_acc,
         },
         path,
     )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Transformer for English-Chinese translation.")
-    parser.add_argument("--data-dir", default="data/cmn-eng-simple")
-    parser.add_argument("--save-dir", default="checkpoints")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--scheduler", choices=["noam", "warmup_cosine", "none"], default="noam")
-    parser.add_argument("--warmup-steps", type=int, default=400)
-    parser.add_argument("--eta-min", type=float, default=1e-5)
-    parser.add_argument("--lr-factor", type=float, default=0.5)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--label-smoothing", type=float, default=0.1)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--d-ff", type=int, default=1024)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--max-len", type=int, default=64)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--bleu-every", type=int, default=1)
-    parser.add_argument("--decode", choices=["beam", "greedy"], default="beam")
-    parser.add_argument("--beam-size", type=int, default=4)
-    parser.add_argument("--length-penalty", type=float, default=0.6)
-    parser.add_argument("--early-stopping-patience", type=int, default=20)
-    parser.add_argument("--min-delta", type=float, default=1e-4)
-    return parser.parse_args()
+def load_best_model(path: Path, device: torch.device) -> tuple[Seq2SeqTransformer, Vocab, Vocab, dict]:
+    ckpt = torch.load(path, map_location=device)
+    src_vocab = Vocab.from_dict(ckpt["src_vocab"])
+    tgt_vocab = Vocab.from_dict(ckpt["tgt_vocab"])
+    model = Seq2SeqTransformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        pad_idx=PAD_IDX,
+        **ckpt["model_args"],
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model, src_vocab, tgt_vocab, ckpt
 
 
 def main() -> None:
     args = parse_args()
+    args.num_encoder_layers = args.num_encoder_layers or args.num_layers
+    args.num_decoder_layers = args.num_decoder_layers or args.num_layers
+    args.test_decode = args.test_decode or args.decode
+    if args.bleu_every < 1:
+        raise ValueError("--bleu_every must be >= 1")
+    set_seed(args.seed)
+
     device = get_device(args.device)
-    src_word2id, _, tgt_word2id, tgt_id2word = load_vocab(args.data_dir)
+    run_name = make_run_name(args)
+    checkpoint_dir = ensure_dir(Path(args.checkpoint_dir) / run_name)
+    output_dir = ensure_dir(Path(args.output_dir) / run_name)
+    print(f"device={device}")
+    print(f"run_name={run_name}")
+    print(f"checkpoint_dir={checkpoint_dir}")
+    print(f"output_dir={output_dir}")
 
-    train_loader = build_dataloader(
-        args.data_dir, "training", src_word2id, tgt_word2id, args.batch_size, True, args.num_workers
-    )
-    val_loader = build_dataloader(
-        args.data_dir, "validation", src_word2id, tgt_word2id, args.batch_size, False, args.num_workers
-    )
+    train_examples = read_parallel_data(args.train_path, args.max_src_len, args.max_tgt_len)
+    valid_examples = read_parallel_data(args.valid_path, args.max_src_len, args.max_tgt_len)
+    test_examples = read_parallel_data(args.test_path, args.max_src_len, args.max_tgt_len)
+    print(f"data: train={len(train_examples)} valid={len(valid_examples)} test={len(test_examples)}")
 
-    model = make_model(args, len(src_word2id), len(tgt_word2id)).to(device)
-    criterion = nn.CrossEntropyLoss(
-        ignore_index=PAD_ID,
-        reduction="sum",
-        label_smoothing=args.label_smoothing,
+    src_vocab, tgt_vocab = build_vocabs(train_examples, min_freq=args.min_freq)
+    print(f"vocab: src={len(src_vocab)} tgt={len(tgt_vocab)}")
+
+    batch_size = args.batch_size
+    if device.type == "cuda":
+        try:
+            _ = torch.empty((batch_size, args.max_len, args.d_model), device=device)
+            del _
+        except RuntimeError:
+            batch_size = min(batch_size, 64)
+            torch.cuda.empty_cache()
+            print(f"GPU memory check failed; using batch_size={batch_size}")
+
+    train_loader = create_dataloader(train_examples, src_vocab, tgt_vocab, batch_size, True, args.num_workers)
+    valid_loader = create_dataloader(valid_examples, src_vocab, tgt_vocab, batch_size, False, args.num_workers)
+    test_loader = create_dataloader(test_examples, src_vocab, tgt_vocab, batch_size, False, args.num_workers)
+
+    model = Seq2SeqTransformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout,
+        max_len=max(args.max_src_len + 1, args.max_tgt_len + 1, args.max_len + 1, 100),
+        pad_idx=PAD_IDX,
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=args.label_smoothing, reduction="sum")
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.98),
+        eps=1e-9,
+        weight_decay=args.weight_decay,
     )
-    base_lr = 1.0 if args.scheduler == "noam" else args.lr
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     scheduler = build_scheduler(args, optimizer, len(train_loader))
 
-    best_bleu = -1.0
+    best_valid_bleu = -1.0
+    best_path = checkpoint_dir / "best.pt"
+    last_path = checkpoint_dir / "last.pt"
     bad_epochs = 0
+
     for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        train_loss = run_epoch(
+        train_loss = train_one_epoch(
             model,
             train_loader,
             criterion,
-            device,
             optimizer,
             scheduler,
+            device,
             args.grad_clip,
-            desc="train",
+            desc=f"epoch {epoch:03d} train",
+            show_progress=args.progress,
         )
-        val_loss = run_epoch(model, val_loader, criterion, device, desc="valid")
-        bleu = float("nan")
-        if args.bleu_every > 0 and epoch % args.bleu_every == 0:
-            bleu = evaluate_bleu(
+        valid_loss, valid_token_acc = evaluate_loss_and_accuracy(
+            model,
+            valid_loader,
+            criterion,
+            device,
+            desc=f"epoch {epoch:03d} valid",
+            show_progress=args.progress,
+        )
+        should_eval_bleu = epoch == 1 or epoch % args.bleu_every == 0 or epoch == args.epochs
+        if should_eval_bleu:
+            valid_bleu, _ = evaluate(
                 model,
-                val_loader,
-                tgt_id2word,
+                valid_loader,
+                src_vocab,
+                tgt_vocab,
                 device,
-                args.max_len,
+                max_len=args.max_len,
                 decode=args.decode,
                 beam_size=args.beam_size,
                 length_penalty=args.length_penalty,
-                desc=f"{args.decode}-bleu",
+                min_len=args.min_decode_len,
+                desc=f"epoch {epoch:03d} {args.decode}",
+                show_progress=args.progress,
             )
+        else:
+            valid_bleu = None
 
-        train_ppl = math.exp(min(train_loss, 20))
-        val_ppl = math.exp(min(val_loss, 20))
+        bleu_text = f"{valid_bleu:.2f}" if valid_bleu is not None else "SKIP"
         print(
-            f"epoch {epoch:03d} train_loss={train_loss:.4f} train_ppl={train_ppl:.2f} "
-            f"val_loss={val_loss:.4f} val_ppl={val_ppl:.2f} bleu={bleu:.4f} "
+            f"epoch {epoch:03d} "
+            f"train_loss={train_loss:.4f} "
+            f"valid_loss={valid_loss:.4f} "
+            f"valid_bleu={bleu_text} "
+            f"valid_token_acc={valid_token_acc:.4f} "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        improved = not math.isnan(bleu) and bleu > best_bleu + args.min_delta
-        if improved:
-            best_bleu = bleu
-            bad_epochs = 0
-            save_checkpoint(Path(args.save_dir) / "best.pt", model, optimizer, scheduler, epoch, val_loss, bleu, args)
-        elif not math.isnan(bleu):
-            bad_epochs += 1
+        checkpoint_bleu = valid_bleu if valid_bleu is not None else best_valid_bleu
+        save_checkpoint(
+            last_path,
+            model,
+            src_vocab,
+            tgt_vocab,
+            args,
+            epoch,
+            checkpoint_bleu,
+            valid_loss,
+            valid_token_acc,
+        )
 
-        save_checkpoint(Path(args.save_dir) / "last.pt", model, optimizer, scheduler, epoch, val_loss, bleu, args)
-        if args.early_stopping_patience > 0 and bad_epochs >= args.early_stopping_patience:
-            print(f"early stopping: BLEU did not improve for {bad_epochs} evaluation rounds")
-            break
+        if valid_bleu is None:
+            continue
+
+        improved = valid_bleu > best_valid_bleu + args.min_delta
+        if improved:
+            best_valid_bleu = valid_bleu
+            bad_epochs = 0
+            save_checkpoint(
+                best_path,
+                model,
+                src_vocab,
+                tgt_vocab,
+                args,
+                epoch,
+                valid_bleu,
+                valid_loss,
+                valid_token_acc,
+            )
+            print(f"saved best checkpoint to {best_path}")
+        elif args.early_stopping_patience > 0:
+            bad_epochs += 1
+            print(
+                f"early_stopping: no BLEU improvement for "
+                f"{bad_epochs}/{args.early_stopping_patience} epochs"
+            )
+            if bad_epochs >= args.early_stopping_patience:
+                print(
+                    f"early stopping at epoch {epoch}: "
+                    f"best_valid_bleu={best_valid_bleu:.2f}"
+                )
+                break
+
+    final_ckpt_path = last_path if args.final_ckpt == "last" else best_path
+    best_model, best_src_vocab, best_tgt_vocab, best_ckpt = load_best_model(final_ckpt_path, device)
+    test_loss, test_token_acc = evaluate_loss_and_accuracy(
+        best_model,
+        test_loader,
+        criterion,
+        device,
+        desc="test loss",
+        show_progress=args.progress,
+    )
+    test_bleu, records = evaluate(
+        best_model,
+        test_loader,
+        best_src_vocab,
+        best_tgt_vocab,
+        device,
+        max_len=args.max_len,
+        decode=args.test_decode,
+        beam_size=args.beam_size,
+        length_penalty=args.length_penalty,
+        min_len=args.min_decode_len,
+        desc=f"test {args.test_decode}",
+        show_progress=args.progress,
+    )
+    write_predictions(records, output_dir / "test_predictions.txt")
+    test_bleu_scores = bleu_scores_from_records(records)
+
+    result = {
+        "test_bleu": round(test_bleu_scores["bleu4"], 2),
+        "test_bleu1": round(test_bleu_scores["bleu1"], 2),
+        "test_bleu2": round(test_bleu_scores["bleu2"], 2),
+        "test_bleu3": round(test_bleu_scores["bleu3"], 2),
+        "test_bleu4": round(test_bleu_scores["bleu4"], 2),
+        "test_token_accuracy": round(test_token_acc, 4),
+        "test_loss": round(test_loss, 4),
+        "best_valid_bleu": round(float(best_ckpt["valid_bleu"]), 2),
+        "best_epoch": int(best_ckpt["epoch"]),
+        "final_ckpt": args.final_ckpt,
+        "final_ckpt_path": str(final_ckpt_path),
+        "model": "Transformer",
+        "d_model": args.d_model,
+        "num_layers": args.num_layers,
+        "nhead": args.nhead,
+        "dim_feedforward": args.dim_feedforward,
+        "dropout": args.dropout,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "scheduler": args.scheduler,
+        "warmup_steps": args.warmup_steps,
+        "eta_min": args.eta_min,
+        "batch_size": batch_size,
+        "valid_decode": args.decode,
+        "test_decode": args.test_decode,
+        "bleu_every": args.bleu_every,
+        "beam_size": args.beam_size if args.test_decode == "beam" else None,
+        "length_penalty": args.length_penalty if args.test_decode == "beam" else None,
+        "early_stopping_patience": args.early_stopping_patience,
+        "min_delta": args.min_delta,
+        "run_name": run_name,
+        "checkpoint_dir": str(checkpoint_dir),
+        "output_dir": str(output_dir),
+    }
+    save_json(result, output_dir / "result.json")
+    print(
+        f"test_bleu1={test_bleu_scores['bleu1']:.2f} "
+        f"test_bleu2={test_bleu_scores['bleu2']:.2f} "
+        f"test_bleu3={test_bleu_scores['bleu3']:.2f} "
+        f"test_bleu4={test_bleu_scores['bleu4']:.2f} "
+        f"test_token_acc={test_token_acc:.4f}"
+    )
+    print(f"wrote {output_dir / 'test_predictions.txt'} and {output_dir / 'result.json'}")
 
 
 if __name__ == "__main__":
