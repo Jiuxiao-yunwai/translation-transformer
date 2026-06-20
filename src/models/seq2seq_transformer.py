@@ -38,11 +38,13 @@ class Seq2SeqTransformer(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
+        # 对矩阵参数使用 Xavier 初始化，和 Transformer 常见训练设置一致。
         for param in self.parameters():
             if param.dim() > 1:
                 nn.init.xavier_uniform_(param)
 
     def encode(self, src: Tensor, src_key_padding_mask: Tensor | None = None) -> Tensor:
+        # embedding 乘 sqrt(d_model) 用于稳定 embedding 与位置编码的尺度。
         src_emb = self.positional_encoding(self.src_tok_emb(src) * math.sqrt(self.d_model))
         return self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
 
@@ -54,6 +56,7 @@ class Seq2SeqTransformer(nn.Module):
         tgt_key_padding_mask: Tensor | None = None,
         memory_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
+        # 解码阶段只能看到当前位置之前的 token，因果 mask 由调用方传入。
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt) * math.sqrt(self.d_model))
         return self.transformer.decoder(
             tgt_emb,

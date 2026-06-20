@@ -40,6 +40,7 @@ def evaluate_loss_and_accuracy(
         src = batch["src"].to(device)
         tgt_input = batch["tgt_input"].to(device)
         tgt_output = batch["tgt_output"].to(device)
+        # 验证损失仍用 teacher forcing，与训练阶段保持同样的 decoder 输入和 mask。
         tgt_mask = generate_square_subsequent_mask(tgt_input.size(0), device)
         src_pad_mask = make_padding_mask(src)
         tgt_pad_mask = make_padding_mask(tgt_input)
@@ -103,6 +104,7 @@ def evaluate(
     )
     for batch in progress:
         src = batch["src"].to(device)
+        # BLEU 评估使用真实自回归解码，不能用 teacher forcing 的逐 token 准确率替代。
         if decode == "beam":
             decoded_tensor = beam_search_decode(
                 model,
@@ -148,6 +150,7 @@ def make_eval_dataloader(examples, src_vocab: Vocab, tgt_vocab: Vocab, batch_siz
 
 
 def bleu_scores_from_records(records: list[dict]) -> dict[str, float]:
+    # 从预测文件同源 records 重新计算 BLEU1-4，保证 result.json 与 test_predictions.txt 一致。
     references = [record["ref"].split() for record in records]
     candidates = [record["hyp"].split() for record in records]
     return corpus_bleu_scores(references, candidates, max_n=4)

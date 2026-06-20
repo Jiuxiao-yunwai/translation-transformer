@@ -15,10 +15,12 @@ class ParallelExample:
 
 
 def tokenize_src(text: str) -> list[str]:
+    # 英文按空格分词并统一小写，和预处理生成的数据格式保持一致。
     return text.lower().strip().split()
 
 
 def tokenize_tgt(text: str) -> list[str]:
+    # 中文数据已经用空格切好词，这里不能再按字切分。
     return text.strip().split()
 
 
@@ -43,6 +45,7 @@ def read_parallel_data(path: str | Path, max_src_len: int = 80, max_tgt_len: int
             tgt_tokens = tokenize_tgt(parts[1])
             if not src_tokens or not tgt_tokens:
                 continue
+            # 过滤过长样本，避免极端长句拖慢训练并扩大显存占用。
             if len(src_tokens) > max_src_len or len(tgt_tokens) > max_tgt_len:
                 continue
             examples.append(ParallelExample(src_tokens=src_tokens, tgt_tokens=tgt_tokens))
@@ -83,6 +86,7 @@ class TranslationDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         example = self.examples[idx]
         src_ids = self.src_vocab.encode(example.src_tokens, add_eos=True)
+        # teacher forcing：decoder 输入以 <bos> 开头，监督目标以 <eos> 结尾，两者整体右移一位。
         tgt_input_ids = [BOS_IDX] + self.tgt_vocab.encode(example.tgt_tokens)
         tgt_output_ids = self.tgt_vocab.encode(example.tgt_tokens) + [EOS_IDX]
         return {
@@ -96,6 +100,7 @@ class TranslationDataset(Dataset):
 
 
 def collate_fn(batch: list[dict]) -> dict:
+    # PyTorch Transformer 默认使用 [seq_len, batch]，所以这里不转成 batch_first。
     src = pad_sequence([item["src_ids"] for item in batch], padding_value=PAD_IDX)
     tgt_input = pad_sequence([item["tgt_input_ids"] for item in batch], padding_value=PAD_IDX)
     tgt_output = pad_sequence([item["tgt_output_ids"] for item in batch], padding_value=PAD_IDX)

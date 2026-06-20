@@ -51,6 +51,7 @@ def main() -> None:
     model, src_vocab, tgt_vocab, ckpt = load_best_model(Path(args.ckpt), device)
     examples = read_parallel_data(args.test_path, args.max_src_len, args.max_tgt_len)
     dataloader = create_dataloader(examples, src_vocab, tgt_vocab, args.batch_size, False, args.num_workers)
+    # loss/accuracy 只作辅助参考；最终模型优劣主要看自回归解码后的 BLEU4。
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.03, reduction="sum")
 
     test_loss, test_token_acc = evaluate_loss_and_accuracy(
@@ -77,6 +78,7 @@ def main() -> None:
     )
 
     output_dir = make_eval_output_dir(args.output_dir, args.run_name)
+    # 保存逐句预测，方便人工检查 BLEU 数字背后的翻译质量。
     write_predictions(records, output_dir / "test_predictions.txt")
     bleu_scores = bleu_scores_from_records(records)
     result = {

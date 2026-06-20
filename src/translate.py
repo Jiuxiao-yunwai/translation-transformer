@@ -39,6 +39,7 @@ def main() -> None:
 
     device = get_device(args.device)
     model, src_vocab, tgt_vocab = load_model(args.ckpt, device)
+    # 单句输入也整理成 [seq_len, batch=1]，与训练/评估时的张量形状一致。
     src_ids = src_vocab.encode(tokenize_src(args.sentence), add_eos=True)
     src = torch.tensor(src_ids, dtype=torch.long, device=device).unsqueeze(1)
 
@@ -56,6 +57,7 @@ def main() -> None:
     else:
         pred = greedy_decode(model, src, src_vocab, tgt_vocab, max_len=args.max_len)
 
+    # 输出前去掉 <bos>/<eos>/<pad> 等控制符，只保留中文词序列。
     pred_ids = pred.squeeze(1).tolist()
     pred_tokens = tgt_vocab.decode(pred_ids, remove_special=True, stop_at_eos=True)
     print(" ".join(pred_tokens))

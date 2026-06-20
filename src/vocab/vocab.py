@@ -30,6 +30,7 @@ class Vocab:
         for tokens in token_lists:
             counter.update(tokens)
 
+        # 先按词频降序、再按字典序排序，保证同样数据每次构建出的词表稳定一致。
         words = [
             word
             for word, freq in sorted(counter.items(), key=lambda item: (-item[1], item[0]))
@@ -75,6 +76,7 @@ class Vocab:
         for idx in ids:
             if stop_at_eos and idx == EOS_IDX:
                 break
+            # BLEU 和输出文件不应包含 padding、起止符等控制 token。
             if remove_special and idx in {PAD_IDX, BOS_IDX, EOS_IDX}:
                 continue
             tokens.append(self.id_to_token(idx))

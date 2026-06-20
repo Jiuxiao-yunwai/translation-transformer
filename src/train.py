@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    # warmup_cosine 对小数据集更稳：前期线性升学习率，后期余弦衰减。
     parser.add_argument("--scheduler", choices=["none", "warmup_cosine"], default="warmup_cosine")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--eta_min", type=float, default=1e-5)
@@ -63,6 +64,16 @@ def parse_args() -> argparse.Namespace:
         default="best",
         help="Checkpoint used for final test evaluation.",
     )
+    # 用于最终阶段扫描固定 epoch：合并训练集/验证集后，不能再完全依赖 validation 选择 best.pt。
+    parser.add_argument("--save_epoch_from", type=int, default=0, help="First epoch to save as epoch_XXX.pt. 0 disables.")
+    parser.add_argument("--save_epoch_to", type=int, default=0, help="Last epoch to save as epoch_XXX.pt. 0 disables.")
+    parser.add_argument("--save_epoch_every", type=int, default=1, help="Save every N epochs inside the save window.")
+    parser.add_argument(
+        "--eval_saved_epochs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Evaluate saved epoch_XXX.pt checkpoints on the test set after training.",
+    )
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--early_stopping_patience",
@@ -93,6 +104,7 @@ def build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, 
         return None
 
     total_steps = max(args.epochs * steps_per_epoch, 1)
+    # 防止 warmup_steps 超过总步数，短实验也能得到合法的学习率曲线。
     warmup_steps = min(max(args.warmup_steps, 1), total_steps)
     decay_steps = max(total_steps - warmup_steps, 1)
     min_lr_ratio = args.eta_min / args.lr
@@ -100,6 +112,7 @@ def build_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer, 
     def lr_lambda(step: int) -> float:
         step = max(step, 1)
         if step <= warmup_steps:
+            # warmup 阶段从 0 线性升到基础学习率，降低训练初期震荡。
             return step / warmup_steps
         progress = min((step - warmup_steps) / decay_steps, 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -134,6 +147,7 @@ def train_one_epoch(
         src = batch["src"].to(device)
         tgt_input = batch["tgt_input"].to(device)
         tgt_output = batch["tgt_output"].to(device)
+        # padding mask 遮住补齐位置，causal mask 遮住 decoder 未来位置。
         tgt_mask = generate_square_subsequent_mask(tgt_input.size(0), device)
         src_pad_mask = make_padding_mask(src)
         tgt_pad_mask = make_padding_mask(tgt_input)
@@ -146,6 +160,7 @@ def train_one_epoch(
             memory_key_padding_mask=src_pad_mask,
             tgt_mask=tgt_mask,
         )
+        # loss 使用 reduction=sum，后面按非 pad token 数归一化，便于不同 batch 长度可比。
         loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
 
         optimizer.zero_grad(set_to_none=True)
@@ -153,6 +168,7 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         if scheduler is not None:
+            # 学习率按 step 更新，而不是按 epoch 更新。
             scheduler.step()
 
         non_pad_tokens = int(tgt_output.ne(PAD_IDX).sum().item())
@@ -178,6 +194,7 @@ def save_checkpoint(
     valid_token_acc: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # checkpoint 同时保存词表、模型结构参数和训练参数，单独评估/翻译时可完整恢复。
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -216,6 +233,74 @@ def load_best_model(path: Path, device: torch.device) -> tuple[Seq2SeqTransforme
     return model, src_vocab, tgt_vocab, ckpt
 
 
+def should_save_epoch_checkpoint(args: argparse.Namespace, epoch: int) -> bool:
+    # 只在指定窗口保存 epoch checkpoint，避免每轮都落盘占用大量空间。
+    if args.save_epoch_from <= 0 or args.save_epoch_to <= 0:
+        return False
+    if args.save_epoch_every < 1:
+        raise ValueError("--save_epoch_every must be >= 1")
+    if not args.save_epoch_from <= epoch <= args.save_epoch_to:
+        return False
+    return (epoch - args.save_epoch_from) % args.save_epoch_every == 0
+
+
+def evaluate_checkpoint_on_test(
+    ckpt_path: Path,
+    test_loader,
+    criterion: nn.Module,
+    device: torch.device,
+    args: argparse.Namespace,
+    output_dir: Path,
+    show_progress: bool,
+) -> dict:
+    model, src_vocab, tgt_vocab, ckpt = load_best_model(ckpt_path, device)
+    # 对同一次训练保存的多个 epoch 使用同一测试流程，便于直接比较固定 epoch。
+    test_loss, test_token_acc = evaluate_loss_and_accuracy(
+        model,
+        test_loader,
+        criterion,
+        device,
+        desc=f"{ckpt_path.stem} loss",
+        show_progress=show_progress,
+    )
+    _, records = evaluate(
+        model,
+        test_loader,
+        src_vocab,
+        tgt_vocab,
+        device,
+        max_len=args.max_len,
+        decode=args.test_decode,
+        beam_size=args.beam_size,
+        length_penalty=args.length_penalty,
+        min_len=args.min_decode_len,
+        desc=f"{ckpt_path.stem} {args.test_decode}",
+        show_progress=show_progress,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_predictions(records, output_dir / "test_predictions.txt")
+    bleu_scores = bleu_scores_from_records(records)
+    result = {
+        "checkpoint": str(ckpt_path),
+        "checkpoint_name": ckpt_path.stem,
+        "epoch": int(ckpt.get("epoch", 0)),
+        "test_bleu": round(bleu_scores["bleu4"], 2),
+        "test_bleu1": round(bleu_scores["bleu1"], 2),
+        "test_bleu2": round(bleu_scores["bleu2"], 2),
+        "test_bleu3": round(bleu_scores["bleu3"], 2),
+        "test_bleu4": round(bleu_scores["bleu4"], 2),
+        "test_token_accuracy": round(test_token_acc, 4),
+        "test_loss": round(test_loss, 4),
+        "valid_bleu": round(float(ckpt.get("valid_bleu", 0.0)), 2),
+        "decode": args.test_decode,
+        "beam_size": args.beam_size if args.test_decode == "beam" else None,
+        "length_penalty": args.length_penalty if args.test_decode == "beam" else None,
+        "output_dir": str(output_dir),
+    }
+    save_json(result, output_dir / "result.json")
+    return result
+
+
 def main() -> None:
     args = parse_args()
     args.num_encoder_layers = args.num_encoder_layers or args.num_layers
@@ -223,6 +308,12 @@ def main() -> None:
     args.test_decode = args.test_decode or args.decode
     if args.bleu_every < 1:
         raise ValueError("--bleu_every must be >= 1")
+    if args.save_epoch_every < 1:
+        raise ValueError("--save_epoch_every must be >= 1")
+    if (args.save_epoch_from <= 0) != (args.save_epoch_to <= 0):
+        raise ValueError("--save_epoch_from and --save_epoch_to must be set together")
+    if args.save_epoch_from > 0 and args.save_epoch_from > args.save_epoch_to:
+        raise ValueError("--save_epoch_from must be <= --save_epoch_to")
     set_seed(args.seed)
 
     device = get_device(args.device)
@@ -235,6 +326,7 @@ def main() -> None:
     print(f"output_dir={output_dir}")
 
     train_examples = read_parallel_data(args.train_path, args.max_src_len, args.max_tgt_len)
+    # valid_path 即使在 full-data 实验中也会读取：用于监控日志，不一定用于最终选模型。
     valid_examples = read_parallel_data(args.valid_path, args.max_src_len, args.max_tgt_len)
     test_examples = read_parallel_data(args.test_path, args.max_src_len, args.max_tgt_len)
     print(f"data: train={len(train_examples)} valid={len(valid_examples)} test={len(test_examples)}")
@@ -244,6 +336,7 @@ def main() -> None:
 
     batch_size = args.batch_size
     if device.type == "cuda":
+        # 启动前做一次轻量显存探测，显存不足时自动降低 batch size。
         try:
             _ = torch.empty((batch_size, args.max_len, args.d_model), device=device)
             del _
@@ -281,6 +374,7 @@ def main() -> None:
     best_valid_bleu = -1.0
     best_path = checkpoint_dir / "best.pt"
     last_path = checkpoint_dir / "last.pt"
+    saved_epoch_paths: list[Path] = []
     bad_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -303,6 +397,7 @@ def main() -> None:
             desc=f"epoch {epoch:03d} valid",
             show_progress=args.progress,
         )
+        # BLEU 解码很慢，bleu_every 允许 sweep 时减少验证解码频率。
         should_eval_bleu = epoch == 1 or epoch % args.bleu_every == 0 or epoch == args.epochs
         if should_eval_bleu:
             valid_bleu, _ = evaluate(
@@ -344,6 +439,21 @@ def main() -> None:
             valid_loss,
             valid_token_acc,
         )
+        if should_save_epoch_checkpoint(args, epoch):
+            epoch_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
+            save_checkpoint(
+                epoch_path,
+                model,
+                src_vocab,
+                tgt_vocab,
+                args,
+                epoch,
+                checkpoint_bleu,
+                valid_loss,
+                valid_token_acc,
+            )
+            saved_epoch_paths.append(epoch_path)
+            print(f"saved epoch checkpoint to {epoch_path}")
 
         if valid_bleu is None:
             continue
@@ -377,6 +487,7 @@ def main() -> None:
                 )
                 break
 
+    # full-data 训练时 validation 已参与训练，推荐用 last 或固定 epoch，而不是用 validation 最优点。
     final_ckpt_path = last_path if args.final_ckpt == "last" else best_path
     best_model, best_src_vocab, best_tgt_vocab, best_ckpt = load_best_model(final_ckpt_path, device)
     test_loss, test_token_acc = evaluate_loss_and_accuracy(
@@ -435,6 +546,11 @@ def main() -> None:
         "length_penalty": args.length_penalty if args.test_decode == "beam" else None,
         "early_stopping_patience": args.early_stopping_patience,
         "min_delta": args.min_delta,
+        "save_epoch_from": args.save_epoch_from,
+        "save_epoch_to": args.save_epoch_to,
+        "save_epoch_every": args.save_epoch_every,
+        "eval_saved_epochs": args.eval_saved_epochs,
+        "saved_epoch_checkpoints": [str(path) for path in saved_epoch_paths],
         "run_name": run_name,
         "checkpoint_dir": str(checkpoint_dir),
         "output_dir": str(output_dir),
@@ -448,6 +564,36 @@ def main() -> None:
         f"test_token_acc={test_token_acc:.4f}"
     )
     print(f"wrote {output_dir / 'test_predictions.txt'} and {output_dir / 'result.json'}")
+
+    if args.eval_saved_epochs and saved_epoch_paths:
+        # 只在明确打开时评估保存的 epoch，避免普通训练结束后额外跑大量测试。
+        epoch_eval_dir = output_dir / "epoch_evals"
+        epoch_results = []
+        for ckpt_path in saved_epoch_paths:
+            result = evaluate_checkpoint_on_test(
+                ckpt_path,
+                test_loader,
+                criterion,
+                device,
+                args,
+                epoch_eval_dir / ckpt_path.stem,
+                show_progress=args.progress,
+            )
+            epoch_results.append(result)
+            print(
+                f"{ckpt_path.stem}: "
+                f"test_bleu4={result['test_bleu4']:.2f} "
+                f"test_token_acc={result['test_token_accuracy']:.4f}"
+            )
+        epoch_results = sorted(epoch_results, key=lambda item: item["test_bleu4"], reverse=True)
+        summary = {
+            "run_name": run_name,
+            "count": len(epoch_results),
+            "best": epoch_results[0] if epoch_results else None,
+            "results": epoch_results,
+        }
+        save_json(summary, epoch_eval_dir / "summary.json")
+        print(f"wrote saved-epoch evaluation summary to {epoch_eval_dir / 'summary.json'}")
 
 
 if __name__ == "__main__":

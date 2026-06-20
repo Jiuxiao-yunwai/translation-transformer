@@ -9,6 +9,7 @@ from vocab import PAD_IDX
 
 
 def set_seed(seed: int) -> None:
+    # 固定 Python、NumPy、PyTorch 随机性，便于复现实验结果。
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -28,10 +29,12 @@ def get_device(name: str) -> torch.device:
 
 
 def make_padding_mask(seq: torch.Tensor, pad_idx: int = PAD_IDX) -> torch.Tensor:
+    # nn.Transformer 的 padding mask 形状是 [batch, seq_len]，输入张量是 [seq_len, batch]。
     return seq.transpose(0, 1).eq(pad_idx)
 
 
 def generate_square_subsequent_mask(size: int, device: torch.device) -> torch.Tensor:
+    # True 表示被遮挡；上三角 mask 阻止 decoder 看到未来 token。
     return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
 
 

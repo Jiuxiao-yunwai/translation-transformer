@@ -22,6 +22,7 @@ def beam_search_decode(
 
     results: list[list[int]] = []
     for batch_idx in range(src.size(1)):
+        # 为了代码清晰逐条样本做 beam search；训练/评估的 batch 维度在外层 dataloader 保留。
         one_src = src[:, batch_idx : batch_idx + 1]
         src_key_padding_mask = make_padding_mask(one_src, src_vocab.token_to_id("<pad>"))
         memory = model.encode(one_src, src_key_padding_mask=src_key_padding_mask)
@@ -39,6 +40,7 @@ def beam_search_decode(
                 out = model.decode(ys, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_key_padding_mask)
                 log_probs = torch.log_softmax(model.generator(out[-1, 0]), dim=-1)
                 if step < min_len:
+                    # 防止过早输出 <eos>，否则短句会因长度惩罚获得不合理高分。
                     log_probs[EOS_IDX] = -1e9
 
                 top_scores, top_ids = torch.topk(log_probs, beam_size)
@@ -49,6 +51,7 @@ def beam_search_decode(
             def normalized(item: tuple[list[int], float, bool]) -> float:
                 token_ids, score, _ = item
                 length = max(len(token_ids) - 1, 1)
+                # 用长度惩罚归一化累计 log 概率，减少 beam search 偏向短句的问题。
                 return score / (length**length_penalty)
 
             beams = sorted(candidates, key=normalized, reverse=True)[:beam_size]
