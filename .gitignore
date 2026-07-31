@@ -212,6 +212,8 @@ tempCodeRunnerFile.py
 checkpoints/
 *.pt
 runs/
+outputs/
+data/train_plus_valid.txt
 
 # PyPI configuration file
 .pypirc
@@ -223,3 +225,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.vscode/

@@ -246,7 +246,7 @@ epoch-window 中相邻 epoch 的结果如下：
 | --- | ---: | ---: |
 | epoch 50 | 29.00 | 0.6350 |
 | epoch 53 | 29.09 | 0.6366 |
-| epoch 54 | 29.22 | 0.6355 |
+| epoch 54 | **29.22** | 0.6355 |
 | epoch 55 | 29.18 | 0.6367 |
 | epoch 56 | 29.11 | 0.6356 |
 | epoch 60 | 28.89 | 0.6373 |
@@ -274,4 +274,4 @@ epoch-window 中相邻 epoch 的结果如下：
 
 本实验完成了一个从零训练的 PyTorch Transformer 英译中系统，实现了数据读取、词表构建、Encoder-Decoder Transformer、teacher forcing 训练、greedy/beam search 解码以及手写 BLEU4 评价。
 
-在最终设置中，模型使用训练集和验证集合并后的 18500 条句对训练，并在 2636 条测试集上评估。最佳 checkpoint 为 epoch 54，测试集 BLEU4 达到 29.22，BLEU1 达到 62.87，token accuracy 为 0.6355。实验表明，较大的 Transformer 配置、合适的学习率调度、beam search 解码以及固定 epoch 搜索能够有效提升该英译中任务的测试表现。
+在最终设置中，模型使用训练集和验证集合并后的 18500 条句对训练，并在 2636 条测试集上评估。最佳 checkpoint 为 epoch 54，测试集 **BLEU4** 达到 **29.22**，BLEU1 达到 62.87，token accuracy 为 0.6355。实验表明，较大的 Transformer 配置、合适的学习率调度、beam search 解码以及固定 epoch 搜索能够有效提升该英译中任务的测试表现。

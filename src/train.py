@@ -17,9 +17,9 @@ from vocab import PAD_IDX, Vocab
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a small Transformer for English-to-Chinese translation.")
-    parser.add_argument("--train_path", default="data/train.txt")
-    parser.add_argument("--valid_path", default="data/valid.txt")
-    parser.add_argument("--test_path", default="data/test.txt")
+    parser.add_argument("--train_path", default="data/cmn-eng-simple/training.txt")
+    parser.add_argument("--valid_path", default="data/cmn-eng-simple/validation.txt")
+    parser.add_argument("--test_path", default="data/cmn-eng-simple/testing.txt")
     parser.add_argument("--checkpoint_dir", default="checkpoints")
     parser.add_argument("--output_dir", default="outputs")
     parser.add_argument("--run_name", default=None, help="Experiment name. Defaults to an auto timestamped name.")
