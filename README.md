@@ -1,18 +1,29 @@
 # 基于 Transformer 的英译中机器翻译
 
+> NLP Project, 2026@NJUIS
+
 这是一个课程作业项目：使用 PyTorch 和 `cmn-eng-simple` 数据集，从零训练 Encoder-Decoder Transformer 完成英文到中文翻译。
 
-项目不使用预训练模型、预训练词向量、HuggingFace 或外部翻译模型。BLEU4 在 `src/metrics/bleu.py` 中手写实现，不调用现成 BLEU 函数。
+当前实验的最佳测试集结果为 **BLEU4 29.22**（epoch 54）。完整配置、参数搜索过程和实验分析见 [`docs/experiment_report.md`](docs/experiment_report.md)。
 
 ## 项目结构
 
 ```text
 .
 ├── data/
-│   ├── train.txt
-│   ├── valid.txt
-│   ├── test.txt
 │   └── cmn-eng-simple/
+│       ├── training.txt
+│       ├── validation.txt
+│       └── testing.txt
+├── docs/
+│   ├── experiment_report.md
+│   └── question.md
+├── scripts/
+│   ├── sweep_train.sh
+│   ├── sweep_train_full_data.sh
+│   ├── sweep_final_from_baseline.sh
+│   ├── sweep_params_epoch_window.sh
+│   └── train_eval_epoch_window.sh
 ├── src/
 │   ├── train.py
 │   ├── evaluate.py
@@ -43,35 +54,7 @@
 └── requirements.txt
 ```
 
-`src/` 已按职责拆分：一个核心类一个文件，例如 `Vocab`、`PositionalEncoding`、`Seq2SeqTransformer` 分别独立放置。
-
-## 数据格式
-
-每行格式必须是：
-
-```text
-english sentence<TAB>chinese sentence
-```
-
-英文处理：
-
-```python
-english.lower().strip().split()
-```
-
-中文处理：
-
-```python
-chinese.strip().split()
-```
-
-中文不使用 jieba，也不重新按字切分。默认过滤长度超过 `80` 的源句或目标句。
-
-特殊符号固定为：
-
-```text
-<pad>=0, <unk>=1, <bos>=2, <eos>=3
-```
+`checkpoints/`、`outputs/` 和由脚本生成的 `data/train_plus_valid.txt` 属于本地训练产物，不纳入 Git 版本控制。
 
 ## 安装依赖
 
@@ -82,55 +65,16 @@ python -m pip install -r requirements.txt
 ## 基础训练命令
 
 ```bash
-cd /home/jiuxiao-u/nlp/translation-transformer
-
-/home/jiuxiao-u/miniconda3/envs/translation-transformer/bin/python src/train.py \
-  --train_path data/cmn-eng-simple/training.txt \
-  --valid_path data/cmn-eng-simple/validation.txt \
-  --test_path data/cmn-eng-simple/testing.txt \
-  --epochs 120 \
-  --batch_size 128 \
-  --num_workers 2 \
-  --d_model 256 \
-  --nhead 4 \
-  --num_layers 3 \
-  --dim_feedforward 512 \
-  --dropout 0.1 \
-  --lr 3e-4 \
-  --label_smoothing 0.03 \
-  --decode beam \
-  --beam_size 5 \
-  --length_penalty 0.8 \
-  --device cuda
+python src/train.py
 ```
 
-## 冲 BLEU4 29+ 的建议命令
+该命令不手动调整任何训练参数，全部使用 `src/train.py` 中的默认配置。默认数据路径为：
 
-```bash
-/home/jiuxiao-u/miniconda3/envs/translation-transformer/bin/python src/train.py \
-  --train_path data/cmn-eng-simple/training.txt \
-  --valid_path data/cmn-eng-simple/validation.txt \
-  --test_path data/cmn-eng-simple/testing.txt \
-  --epochs 160 \
-  --batch_size 96 \
-  --num_workers 2 \
-  --d_model 384 \
-  --nhead 6 \
-  --num_layers 3 \
-  --dim_feedforward 1024 \
-  --dropout 0.1 \
-  --lr 3e-4 \
-  --scheduler warmup_cosine \
-  --warmup_steps 800 \
-  --eta_min 1e-5 \
-  --label_smoothing 0.03 \
-  --decode beam \
-  --beam_size 5 \
-  --length_penalty 0.8 \
-  --device cuda
+```text
+train_path=data/cmn-eng-simple/training.txt
+valid_path=data/cmn-eng-simple/validation.txt
+test_path=data/cmn-eng-simple/testing.txt
 ```
-
-显存不足时，把 `--batch_size 96` 改成 `64`。
 
 训练时每个 epoch 会输出：
 
@@ -180,7 +124,7 @@ test_bleu1, test_bleu2, test_bleu3, test_bleu4, test_token_accuracy
 ## 单独评估
 
 ```bash
-/home/jiuxiao-u/miniconda3/envs/translation-transformer/bin/python src/evaluate.py \
+python src/evaluate.py \
   --ckpt checkpoints/<run_name>/best.pt \
   --test_path data/cmn-eng-simple/testing.txt \
   --run_name eval_<run_name> \
@@ -193,165 +137,13 @@ test_bleu1, test_bleu2, test_bleu3, test_bleu4, test_token_accuracy
 ## 单句翻译
 
 ```bash
-/home/jiuxiao-u/miniconda3/envs/translation-transformer/bin/python src/translate.py \
+python src/translate.py \
   --ckpt checkpoints/<run_name>/best.pt \
   --sentence "tom is a student ." \
   --decode beam \
   --beam_size 5 \
   --length_penalty 0.8 \
   --device cuda
-```
-
-## 参数搜索脚本
-
-训练参数 sweep：
-
-```bash
-bash scripts/sweep_train.sh
-```
-
-它会自动生成带时间戳的实验名，例如：
-
-```text
-20260609_223000_dm384_bs128_lr3e4_do01
-```
-
-结果分别写到：
-
-```text
-checkpoints/<run_name>/best.pt
-outputs/<run_name>/result.json
-outputs/<run_name>/train.log
-```
-
-可以用环境变量临时覆盖部分设置：
-
-```bash
-SWEEP_EPOCHS=120 DEVICE=cuda NUM_WORKERS=2 bash scripts/sweep_train.sh
-```
-
-对某个 checkpoint 扫 beam 解码参数：
-
-```bash
-bash scripts/sweep_decode.sh checkpoints/<run_name>/best.pt
-```
-
-它按两步执行：
-
-```text
-1. 固定 beam_size=5，搜索 length_penalty = 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0
-2. 自动读取第 1 步最好的 length_penalty，再搜索 beam_size = 3, 4, 5, 8
-```
-
-使用训练集和验证集合并训练的参数 sweep：
-
-```bash
-bash scripts/sweep_train_full_data.sh
-```
-
-训练 sweep 默认最多跑 `50` 个 epoch，并启用早停。需要更久时可以覆盖：
-
-```bash
-SWEEP_EPOCHS=120 bash scripts/sweep_train_full_data.sh
-```
-
-这个脚本会自动生成：
-
-```text
-data/train_plus_valid.txt
-```
-
-内容是：
-
-```text
-data/cmn-eng-simple/training.txt + data/cmn-eng-simple/validation.txt
-```
-
-注意：因为 validation 也被放进训练集，`best_valid_bleu` 会偏乐观。这个脚本主要看最终 `test_bleu4`。
-
-该脚本默认用 `last.pt` 做最终测试：
-
-```text
---final_ckpt last
-```
-
-这样不会依赖已经参与训练的 validation 来选择 `best.pt`。
-
-它会自动尝试多组参数，包括：
-
-```text
-nhead = 6, 8
-num_layers = 3, 4
-batch_size = 48, 64, 96, 128
-d_model = 384, 512
-dim_feedforward = 1024, 1536
-lr = 3e-4, 2e-4
-dropout = 0.1, 0.15
-```
-
-基于当前最佳配置的最终训练局部搜索：
-
-```bash
-bash scripts/sweep_final_from_baseline.sh
-```
-
-该脚本以 `dm512_h8_l4_bs48_ff1536_lr2e4_do015` 为基准，固定：
-
-```text
-train = training + validation
-final_ckpt = last
-test_decode = beam
-bleu_every = 999
-early_stopping = off
-```
-
-默认运行第二阶段，只搜索 dropout 和 label smoothing：
-
-```text
-A: dropout=0.12, label_smoothing=0.03
-B: dropout=0.18, label_smoothing=0.03
-C: dropout=0.15, label_smoothing=0.02
-D: dropout=0.15, label_smoothing=0.04
-E: dropout=0.15, label_smoothing=0.03
-```
-
-第三阶段学习率搜索：
-
-```bash
-STAGE=lr DROPOUT=0.15 LABEL_SMOOTHING=0.03 bash scripts/sweep_final_from_baseline.sh
-```
-
-会搜索：
-
-```text
-lr = 1.5e-4, 2e-4, 2.5e-4, 3e-4
-```
-
-第四阶段比较 3 层和 4 层：
-
-```bash
-STAGE=layers DROPOUT=0.15 LABEL_SMOOTHING=0.03 bash scripts/sweep_final_from_baseline.sh
-```
-
-固定 epoch 对比：
-
-```bash
-STAGE=epochs bash scripts/sweep_final_from_baseline.sh
-```
-
-会搜索：
-
-```text
-epoch = 43, 47, 50, 55
-```
-
-脚本会按 batch size 自动设置 warmup：
-
-```text
-batch_size=48  -> warmup_steps=400
-batch_size=64  -> warmup_steps=400
-batch_size=96  -> warmup_steps=300
-batch_size=128 -> warmup_steps=300
 ```
 
 ## 实现要点
@@ -363,7 +155,7 @@ batch_size=128 -> warmup_steps=300
 - 优化器：`Adam(lr=3e-4, betas=(0.9, 0.98), eps=1e-9)`
 - mask：padding mask + target causal mask
 - 解码：greedy 或 beam search
-- 指标：手写 BLEU4 + token-level accuracy
+- 指标：BLEU4 + token-level accuracy
 - 输出：`checkpoints/best.pt`、`outputs/test_predictions.txt`、`outputs/result.json`
 
 ## 调参建议
@@ -405,3 +197,19 @@ batch_size=128 -> warmup_steps=300
 ```bash
 BLEU_EVERY=5 bash scripts/sweep_train_full_data.sh
 ```
+
+## 复现最终实验
+
+最终阶段将训练集和验证集合并，并保存 epoch 40–60 的 checkpoint 逐一评估：
+
+```bash
+bash scripts/train_eval_epoch_window.sh
+```
+
+在 batch size、学习率、dropout 和 label smoothing 的局部范围内搜索时使用：
+
+```bash
+bash scripts/sweep_params_epoch_window.sh
+```
+
+两个脚本都支持通过环境变量覆盖参数；默认使用 CUDA，并将 checkpoint 和评估结果分别写入 `checkpoints/` 与 `outputs/`。
